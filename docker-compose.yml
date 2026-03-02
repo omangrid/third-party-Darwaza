@@ -1,0 +1,394 @@
+name: gis-approval
+ 
+services:
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    env_file:
+      - .env
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - my_network
+ 
+  seq:
+    image: datalust/seq:latest
+    env_file:
+      - .env
+    environment:
+      ACCEPT_EULA: "Y"
+      SEQ_FIRSTRUN_ADMINPASSWORD: ${SEQ_FIRSTRUN_ADMINPASSWORD}
+      VIRTUAL_HOST: ${SEQ_VIRTUAL_HOST}
+      VIRTUAL_PORT: ${SEQ_VIRTUAL_PORT}
+    ports:
+      - "5341:80"
+    volumes:
+      - seq-data:/data
+    networks:
+      - my_network
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    env_file:
+      - .env
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: ${SQL_SA_PASSWORD}
+    ports:
+      - "1433:1433"
+    volumes:
+      - sql-data:/var/opt/mssql
+    networks:
+      - my_network
+ 
+  gateway-svc:
+    build:
+      context: .
+      dockerfile: src/GateWayService/Dockerfile
+    image: oetc/gateway-svc:latest
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: Docker
+      ASPNETCORE_URLS: http://+:80
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+      ApiIdentifier: ${API_IDENTIFIER}
+      AzureAd__Instance: ${AZURE_AD_INSTANCE}
+      AzureAd__TenantId: ${AZURE_AD_TENANT_ID}
+      AzureAd__Authority: ${AZURE_AD_AUTHORITY}
+      AzureAd__Issuer: ${AZURE_AD_ISSUER}
+      AzureAd__RequireHttpsMetadata: ${AZURE_AD_REQUIRE_HTTPS_METADATA_GATEWAY}
+      ClientApp: ${CLIENT_APP_URL}
+      VIRTUAL_HOST: ${GATEWAY_VIRTUAL_HOST}
+      VIRTUAL_PORT: "80"
+    ports:
+      - "6001:80"
+    depends_on:
+      - seq
+    networks:
+      - my_network
+ 
+  approval-svc:
+    build:
+      context: .
+      dockerfile: src/ApprovalService/Dockerfile
+    image: oetc/approval-svc:latest
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_HTTP_PORTS: "80"
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_DEFAULT_USER}
+      RabbitMq__Password: ${RABBITMQ_DEFAULT_PASS}
+      InternalServiceKey: ${INTERNAL_SERVICE_KEY:-dev-internal-key}
+      ConnectionStrings__DefaultConnection: >
+        Data Source=sqlserver,1433;Initial Catalog=approvals;User ID=sa;Password=${SQL_SA_PASSWORD};TrustServerCertificate=True;
+      ProfileService__BaseUrl: http://profile-svc
+      ProfileService__Auth__ClientId: ${AZURE_AD_CLIENT_ID}
+      ProfileService__Auth__ClientSecret: ${AZURE_AD_CLIENT_SECRET}
+      ApiIdentifier: ${API_IDENTIFIER}
+      AzureAd__Instance: ${AZURE_AD_INSTANCE}
+      AzureAd__TenantId: ${AZURE_AD_TENANT_ID}
+      AzureAd__Authority: ${AZURE_AD_AUTHORITY}
+      AzureAd__Issuer: ${AZURE_AD_ISSUER}
+      AzureAd__RequireHttpsMetadata: ${AZURE_AD_REQUIRE_HTTPS_METADATA}
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "7001:80"
+    volumes:
+      - ./data/keys/approval-svc:/root/.aspnet/DataProtection-Keys
+    depends_on:
+      - rabbitmq
+      - seq
+      - sqlserver
+    networks:
+      - my_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+ 
+  request-svc:
+    build:
+      context: .
+      dockerfile: src/RequestService/Dockerfile
+    image: oetc/request-svc:latest
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_URLS: http://+:80
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_DEFAULT_USER}
+      RabbitMq__Password: ${RABBITMQ_DEFAULT_PASS}
+      LegacySeeding__Enabled: ${LEGACY_SEEDING_ENABLED}
+      LegacySeeding__SkipAlreadySeededApprovals: ${LEGACY_SEEDING_SKIP_ALREADY}
+      InternalServiceKey: ${INTERNAL_SERVICE_KEY:-dev-internal-key}
+      ApprovalServiceUrl: http://approval-svc
+      ApprovalApi__BaseUrl: http://approval-svc
+      ConnectionStrings__DefaultConnection: >
+        Data Source=sqlserver,1433;Initial Catalog=requests;User ID=sa;Password=${SQL_SA_PASSWORD};TrustServerCertificate=True
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "7010:80"
+    depends_on:
+      - rabbitmq
+      - seq
+      - sqlserver
+      - approval-svc
+    networks:
+      - my_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+ 
+  email-svc:
+    build:
+      context: .
+      dockerfile: src/EmailService/Dockerfile
+    image: oetc/email-svc:latest
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_URLS: http://+:80
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_DEFAULT_USER}
+      RabbitMq__Password: ${RABBITMQ_DEFAULT_PASS}
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "7003:80"
+    depends_on:
+      - rabbitmq
+      - seq
+      - sqlserver
+    networks:
+      - my_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+ 
+  file-svc:
+    build:
+      context: .
+      dockerfile: src/FileService/Dockerfile
+    image: oetc/file-svc:latest
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_URLS: http://+:80
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_DEFAULT_USER}
+      RabbitMq__Password: ${RABBITMQ_DEFAULT_PASS}
+      ApiIdentifier: ${API_IDENTIFIER}
+      AzureAd__Instance: ${AZURE_AD_INSTANCE}
+      AzureAd__TenantId: ${AZURE_AD_TENANT_ID}
+      AzureAd__Authority: ${AZURE_AD_AUTHORITY}
+      AzureAd__Issuer: ${AZURE_AD_ISSUER}
+      AzureAd__RequireHttpsMetadata: ${AZURE_AD_REQUIRE_HTTPS_METADATA}
+      UploadSettings__AbsolutePath: /app/uploads
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "7004:80"
+    depends_on:
+      - rabbitmq
+      - seq
+      - sqlserver
+    networks:
+      - my_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+ 
+  notify-svc:
+    build:
+      context: .
+      dockerfile: src/NotificationService/Dockerfile
+    image: oetc/notify-svc:latest
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_URLS: http://+:80
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_DEFAULT_USER}
+      RabbitMq__Password: ${RABBITMQ_DEFAULT_PASS}
+      ConnectionStrings__DefaultConnection: >
+        Data Source=sqlserver,1433;Initial Catalog=notify;User ID=sa;Password=${SQL_SA_PASSWORD};TrustServerCertificate=True
+      AzureAd__Instance: ${AZURE_AD_INSTANCE}
+      AzureAd__TenantId: ${AZURE_AD_TENANT_ID}
+      AzureAd__Authority: ${AZURE_AD_AUTHORITY}
+      AzureAd__Issuer: ${AZURE_AD_ISSUER}
+      AzureAd__RequireHttpsMetadata: ${AZURE_AD_REQUIRE_HTTPS_METADATA_NOTIFY}
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "7005:80"
+    depends_on:
+      - rabbitmq
+      - seq
+      - sqlserver
+    networks:
+      - my_network
+ 
+  profile-svc:
+    build:
+      context: .
+      dockerfile: src/ProfileService/Dockerfile
+    image: oetc/profile-svc:latest
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_URLS: http://+:80
+      ConnectionStrings__ProfileDbConnection: >
+        Data Source=sqlserver,1433;Initial Catalog=profile;User ID=sa;Password=${SQL_SA_PASSWORD};TrustServerCertificate=True
+      AzureAd__TenantId: ${AZURE_AD_TENANT_ID}
+      AzureAd__ClientId: ${AZURE_AD_CLIENT_ID}
+      AzureAd__ClientSecret: ${AZURE_AD_CLIENT_SECRET}
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "7006:80"
+    depends_on:
+      - seq
+      - sqlserver
+    networks:
+      - my_network
+ 
+  report-svc:
+    build:
+      context: .
+      dockerfile: src/ReportService/Dockerfile
+    image: oetc/report-svc
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_URLS: http://+:80
+      ApiIdentifier: ${API_IDENTIFIER}
+      AzureAd__Instance: ${AZURE_AD_INSTANCE}
+      AzureAd__TenantId: ${AZURE_AD_TENANT_ID}
+      AzureAd__Authority: ${AZURE_AD_AUTHORITY}
+      AzureAd__Issuer: ${AZURE_AD_ISSUER}
+      AzureAd__RequireHttpsMetadata: ${AZURE_AD_REQUIRE_HTTPS_METADATA}
+      Services__Approvals__BaseUrl: http://approval-svc
+      Services__Requests__BaseUrl: http://request-svc
+      HttpClient__RetryCount: ${HTTPCLIENT_RETRY_COUNT}
+      HttpClient__RetryBackoffSeconds: ${HTTPCLIENT_RETRY_BACKOFF_SECONDS}
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "7012:80"
+    depends_on:
+      - seq
+      - approval-svc
+    networks:
+      - my_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+ 
+  web-app:
+    image: oetc/web-app
+    build:
+      context: .
+      dockerfile: frontend/web-app/Dockerfile
+    env_file:
+      - .env
+    volumes:
+      - ./data/web-app:/var/lib/web/data
+    ports:
+      - "3000:3000"
+    environment:
+      AZURE_AD_CLIENT_ID: ${AZURE_AD_CLIENT_ID}
+      AZURE_AD_CLIENT_SECRET: ${AZURE_AD_CLIENT_SECRET}
+      AZURE_AD_TENANT_ID: ${AZURE_AD_TENANT_ID}
+      NEXTAUTH_URL: ${NEXTAUTH_URL}
+      AUTH_TRUST_HOST: ${AUTH_TRUST_HOST}
+      AUTH_URL_INTERNAL: ${AUTH_URL_INTERNAL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      GATEWAY_BASE: http://gateway-svc/
+      NOTIFY_URL: ${WEB_NOTIFY_URL}
+      SEQ_URL: http://seq
+      VIRTUAL_HOST: ${WEB_VIRTUAL_HOST}
+      VIRTUAL_PORT: ${WEB_VIRTUAL_PORT}
+    networks:
+      - my_network
+ 
+  nginx-proxy:
+    image: nginxproxy/nginx-proxy
+    env_file:
+      - .env
+    environment:
+      NGINX_PROXY_IP_HASH: "true"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ./devcerts:/etc/nginx/certs
+      - ./custom.conf:/etc/nginx/conf.d/custom.conf:ro
+    networks:
+      - my_network
+ 
+  absher-svc:
+    image: oetc/absher-svc:latest
+    pull_policy: always
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT}
+      ASPNETCORE_URLS: http://+:80
+      ConnectionStrings__DefaultConnection: >
+        Data Source=sqlserver,1433;Initial Catalog=ITTicketingSystem;User ID=sa;Password=${SQL_SA_PASSWORD};TrustServerCertificate=True;
+      ApiIdentifier: ${API_IDENTIFIER}
+      AzureAd__Instance: ${AZURE_AD_INSTANCE}
+      AzureAd__ClientId: ${AZURE_AD_CLIENT_ID}
+      AzureAd__TenantId: ${AZURE_AD_TENANT_ID}
+      AzureAd__Authority: ${AZURE_AD_AUTHORITY}
+      AzureAd__Issuer: ${AZURE_AD_ISSUER}
+      AzureAd__RequireHttpsMetadata: ${AZURE_AD_REQUIRE_HTTPS_METADATA}
+      ProfileService__BaseUrl: http://profile-svc
+      FileService__BaseUrl: http://file-svc
+      ApprovalService__BaseUrl: http://approval-svc/api/approvals
+      ApprovalService__AppIdentifier: ${ABSHER_APPROVAL_APP_IDENTIFIER}
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Username: ${RABBITMQ_DEFAULT_USER}
+      RabbitMq__Password: ${RABBITMQ_DEFAULT_PASS}
+      Frontend__Url: ${CLIENT_APP_URL}
+      Serilog__WriteTo__0__Name: Seq
+      Serilog__WriteTo__0__Args__serverUrl: http://seq
+    ports:
+      - "5050:80"
+    depends_on:
+      - rabbitmq
+      - seq
+      - sqlserver
+      - profile-svc
+      - file-svc
+      - approval-svc
+    networks:
+      - my_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+ 
+volumes:
+  sql-data:
+  grafana-data:
+  seq-data:
+ 
+ 
+networks:
+  my_network:
+    driver: bridge
